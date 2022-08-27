@@ -8,4 +8,5 @@ build:
     - "ftfy==6.1.1"
     - "scipy==1.9.0"
     - "transformers==4.21.1"
-predict: "predict.py:Predictor"
+predict: "predict_animate.py:Predictor"
+image: "r8.im/andreasjansson/stable-diffusion-animation"
