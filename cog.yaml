@@ -11,6 +11,7 @@ build:
     - "scipy==1.9.0"
     - "transformers==4.21.1"
     - "opencv-python==4.6.0.66"
+    - "av==9.2.0"
 
     # FILM requirements
     - "tensorflow==2.8.0"

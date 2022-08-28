@@ -3,6 +3,7 @@ import os
 from typing import Optional, List
 
 import cv2
+import av
 import numpy as np
 import torch
 from torch import autocast
@@ -179,13 +180,28 @@ class Predictor(BasePredictor):
     def save_mp4(self, images, fps, width, height):
         print("Saving MP4")
         output_path = "/tmp/output.mp4"
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'MP4V'), fps, (width, height))
-        for image in images:
+
+        output = av.open(output_path, "w")
+        stream = output.add_stream(
+            "h264", rate=fps, options={"crf": "17", "tune": "film"}
+        )
+        # stream.bit_rate = 8000000
+        # stream.bit_rate = 16000000
+        stream.width = width
+        stream.height = height
+
+        for i, image in enumerate(images):
             image = (image * 255).astype(np.uint8)
-            print(image.shape, image.dtype)
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            out.write(image)
-        out.release()
+            frame = av.VideoFrame.from_ndarray(image, format="bgr24")
+            packet = stream.encode(frame)
+            output.mux(packet)
+
+        # flush
+        packet = stream.encode(None)
+        output.mux(packet)
+        output.close()
+
         return Path(output_path)
 
     def save_gif(self, images, fps):
