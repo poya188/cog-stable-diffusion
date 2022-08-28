@@ -2,6 +2,7 @@ import sys
 import os
 from typing import Optional, List
 
+import cv2
 import numpy as np
 import torch
 from torch import autocast
@@ -95,6 +96,9 @@ class Predictor(BasePredictor):
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
+        output_format: str = Input(
+            description="Output file format", choices=["gif", "mp4"], default="gif"
+        ),
     ) -> Path:
         """Run a single prediction on the model"""
         if seed is None:
@@ -120,7 +124,7 @@ class Predictor(BasePredictor):
         text_embeddings_end = self.pipe.embed_text(
             prompt_end, do_classifier_free_guidance, batch_size
         )
-        text_embeddings_mid = text_embeddings_start * 0.5 + text_embeddings_end * 0.5
+        text_embeddings_mid = slerp(0.5, text_embeddings_start, text_embeddings_end)
         latents_mid = self.pipe.denoise(
             latents=initial_latents,
             text_embeddings=text_embeddings_mid,
@@ -133,8 +137,11 @@ class Predictor(BasePredictor):
         frames_latents = []
         for i in range(num_animation_frames):
             print(f"Generating frame {i}")
-            x = i / (num_animation_frames - 1)
-            text_embeddings = text_embeddings_start * (1 - x) + text_embeddings_end * x
+            text_embeddings = slerp(
+                i / (num_animation_frames - 1),
+                text_embeddings_start,
+                text_embeddings_end,
+            )
 
             # re-initialize scheduler
             self.pipe.scheduler = make_scheduler(num_inference_steps)
@@ -160,15 +167,35 @@ class Predictor(BasePredictor):
         else:
             images = self.interpolate_latents(frames_latents, num_interpolation_steps)
 
-        # Save the gif
-        print("Saving GIF")
-        output_path = "/tmp/video.gif"
-
+        # Save the video
         if gif_ping_pong:
             images += images[-1:1:-1]
-        gif_frame_duration = int(1000 / gif_frames_per_second)
 
-        pil_images = [self.pipe.numpy_to_pil(img.astype("float32"))[0] for img in images]
+        if output_format == "gif":
+            return self.save_gif(images, gif_frames_per_second)
+        else:
+            return self.save_mp4(images, gif_frames_per_second, width, height)
+
+    def save_mp4(self, images, fps, width, height):
+        print("Saving MP4")
+        output_path = "/tmp/output.mp4"
+        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'MP4V'), fps, (width, height))
+        for image in images:
+            image = (image * 255).astype(np.uint8)
+            print(image.shape, image.dtype)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            out.write(image)
+        out.release()
+        return Path(output_path)
+
+    def save_gif(self, images, fps):
+        print("Saving GIF")
+        pil_images = [
+            self.pipe.numpy_to_pil(img.astype("float32"))[0] for img in images
+        ]
+
+        output_path = "/tmp/video.gif"
+        gif_frame_duration = int(1000 / fps)
 
         with open(output_path, "wb") as f:
             pil_images[0].save(
@@ -205,11 +232,11 @@ class Predictor(BasePredictor):
             return images
 
         num_recursion_steps = max(int(np.ceil(np.log2(num_interpolation_steps))), 1)
-        return list(
-            film_util.interpolate_recursively_from_memory(
-                images, num_recursion_steps, self.interpolator
-            )
+        images = film_util.interpolate_recursively_from_memory(
+            images, num_recursion_steps, self.interpolator
         )
+        images = [img.clip(0, 1) for img in images]
+        return images
 
 
 def make_scheduler(num_inference_steps):
@@ -218,3 +245,31 @@ def make_scheduler(num_inference_steps):
     )
     scheduler.set_timesteps(num_inference_steps, offset=1)
     return scheduler
+
+
+def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
+    """helper function to spherically interpolate two arrays v1 v2"""
+    # from https://gist.github.com/nateraw/c989468b74c616ebbc6474aa8cdd9e53
+
+    if not isinstance(v0, np.ndarray):
+        inputs_are_torch = True
+        input_device = v0.device
+        v0 = v0.cpu().numpy()
+        v1 = v1.cpu().numpy()
+
+    dot = np.sum(v0 * v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
+    if np.abs(dot) > DOT_THRESHOLD:
+        v2 = (1 - t) * v0 + t * v1
+    else:
+        theta_0 = np.arccos(dot)
+        sin_theta_0 = np.sin(theta_0)
+        theta_t = theta_0 * t
+        sin_theta_t = np.sin(theta_t)
+        s0 = np.sin(theta_0 - theta_t) / sin_theta_0
+        s1 = sin_theta_t / sin_theta_0
+        v2 = s0 * v0 + s1 * v1
+
+    if inputs_are_torch:
+        v2 = torch.from_numpy(v2).to(input_device)
+
+    return v2
