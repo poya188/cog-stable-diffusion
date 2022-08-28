@@ -1,14 +1,19 @@
+import sys
 import os
 from typing import Optional, List
 
+import numpy as np
 import torch
 from torch import autocast
+import tensorflow as tf
 from diffusers import PNDMScheduler, LMSDiscreteScheduler
 from PIL import Image
 from cog import BasePredictor, Input, Path
 
 from animate import StableDiffusionAnimationPipeline
 
+sys.path.append("/frame-interpolation")
+from eval import interpolator as film_interpolator, util as film_util
 
 MODEL_CACHE = "diffusers-cache"
 
@@ -25,6 +30,18 @@ class Predictor(BasePredictor):
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         ).to("cuda")
+
+        # Stop tensorflow eagerly taking all GPU memory
+        gpus = tf.config.experimental.list_physical_devices("GPU")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+
+        print("Loading interpolator...")
+        self.interpolator = film_interpolator.Interpolator(
+            # from https://drive.google.com/drive/folders/1i9Go1YI2qiFWeT5QtywNFmYAA74bhXWj?usp=sharing
+            "/src/frame_interpolation_saved_model",
+            None,
+        )
 
     @torch.inference_mode()
     @torch.cuda.amp.autocast()
@@ -69,6 +86,10 @@ class Predictor(BasePredictor):
         ),
         gif_ping_pong: bool = Input(
             description="Whether to reverse the animation and go back to the beginning before looping",
+            default=False,
+        ),
+        film_interpolation: bool = Input(
+            description="Whether to use FILM for between-frame interpolation (film-net.github.io)",
             default=False,
         ),
         seed: int = Input(
@@ -125,7 +146,6 @@ class Predictor(BasePredictor):
                 t_end=None,
                 guidance_scale=guidance_scale,
             )
-            self.pipe.numpy_to_pil(self.pipe.latents_to_image(latents))[0].save("test.png")
 
             # Run safety check on first and last frame
             if i == 0 or i == num_animation_frames - 1:
@@ -135,17 +155,10 @@ class Predictor(BasePredictor):
             frames_latents.append(latents)
 
         # Decode images by interpolate between animation frames
-        print("Generating images from latents")
-        images = []
-        for i in range(num_animation_frames - 1):
-            latents_start = frames_latents[i]
-            latents_end = frames_latents[i + 1]
-            for j in range(num_interpolation_steps):
-                x = j / num_interpolation_steps
-                latents = latents_start * (1 - x) + latents_end * x
-                numpy_image = self.pipe.latents_to_image(latents)
-                image = self.pipe.numpy_to_pil(numpy_image.astype("float32"))[0]
-                images.append(image)
+        if film_interpolation:
+            images = self.interpolate_film(frames_latents, num_interpolation_steps)
+        else:
+            images = self.interpolate_latents(frames_latents, num_interpolation_steps)
 
         # Save the gif
         print("Saving GIF")
@@ -155,18 +168,48 @@ class Predictor(BasePredictor):
             images += images[-1:1:-1]
         gif_frame_duration = int(1000 / gif_frames_per_second)
 
-        image = images[0]
+        pil_images = [self.pipe.numpy_to_pil(img.astype("float32"))[0] for img in images]
+
         with open(output_path, "wb") as f:
-            image.save(
+            pil_images[0].save(
                 fp=f,
                 format="GIF",
-                append_images=images[1:],
+                append_images=pil_images[1:],
                 save_all=True,
                 duration=gif_frame_duration,
                 loop=0,
             )
 
         return Path(output_path)
+
+    def interpolate_latents(self, frames_latents, num_interpolation_steps):
+        print("Interpolating images from latents")
+        images = []
+        for i in range(len(frames_latents) - 1):
+            latents_start = frames_latents[i]
+            latents_end = frames_latents[i + 1]
+            for j in range(num_interpolation_steps):
+                x = j / num_interpolation_steps
+                latents = latents_start * (1 - x) + latents_end * x
+                image = self.pipe.latents_to_image(latents)
+                images.append(image)
+        return images
+
+    def interpolate_film(self, frames_latents, num_interpolation_steps):
+        print("Interpolating images with FILM")
+        images = [
+            self.pipe.latents_to_image(lat)[0].astype("float32")
+            for lat in frames_latents
+        ]
+        if num_interpolation_steps == 0:
+            return images
+
+        num_recursion_steps = max(int(np.ceil(np.log2(num_interpolation_steps))), 1)
+        return list(
+            film_util.interpolate_recursively_from_memory(
+                images, num_recursion_steps, self.interpolator
+            )
+        )
 
 
 def make_scheduler(num_inference_steps):
