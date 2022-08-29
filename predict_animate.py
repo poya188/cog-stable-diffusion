@@ -1,6 +1,6 @@
 import sys
 import os
-from typing import Optional, List
+from typing import Optional, List, Iterator
 
 import cv2
 import av
@@ -94,88 +94,135 @@ class Predictor(BasePredictor):
             description="Whether to use FILM for between-frame interpolation (film-net.github.io)",
             default=False,
         ),
+        intermediate_output: bool = Input(
+            description="Whether to display intermediate outputs during generation",
+            default=False,
+        ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
         output_format: str = Input(
             description="Output file format", choices=["gif", "mp4"], default="gif"
         ),
-    ) -> Path:
+    ) -> Iterator[Path]:
         """Run a single prediction on the model"""
-        if seed is None:
-            seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
-        generator = torch.Generator("cuda").manual_seed(seed)
+        with torch.autocast("cuda"), torch.inference_mode():
+            if seed is None:
+                seed = int.from_bytes(os.urandom(2), "big")
+            print(f"Using seed: {seed}")
+            generator = torch.Generator("cuda").manual_seed(seed)
 
-        batch_size = 1
+            batch_size = 1
 
-        # Generate initial latents to start to generate animation frames from
-        initial_scheduler = self.pipe.scheduler = make_scheduler(num_inference_steps)
-        num_initial_steps = int(num_inference_steps * (1 - prompt_strength))
-        print(f"Generating initial latents for {num_initial_steps} steps")
-        initial_latents = torch.randn(
-            (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
-            generator=generator,
-            device="cuda",
-        )
-        do_classifier_free_guidance = guidance_scale > 1.0
-        text_embeddings_start = self.pipe.embed_text(
-            prompt_start, do_classifier_free_guidance, batch_size
-        )
-        text_embeddings_end = self.pipe.embed_text(
-            prompt_end, do_classifier_free_guidance, batch_size
-        )
-        text_embeddings_mid = slerp(0.5, text_embeddings_start, text_embeddings_end)
-        latents_mid = self.pipe.denoise(
-            latents=initial_latents,
-            text_embeddings=text_embeddings_mid,
-            t_start=1,
-            t_end=num_initial_steps,
-            guidance_scale=guidance_scale,
-        )
-
-        # Generate latents for animation frames
-        frames_latents = []
-        for i in range(num_animation_frames):
-            print(f"Generating frame {i}")
-            text_embeddings = slerp(
-                i / (num_animation_frames - 1),
-                text_embeddings_start,
-                text_embeddings_end,
+            # Generate initial latents to start to generate animation frames from
+            initial_scheduler = self.pipe.scheduler = make_scheduler(
+                num_inference_steps
+            )
+            num_initial_steps = int(num_inference_steps * (1 - prompt_strength))
+            print(f"Generating initial latents for {num_initial_steps} steps")
+            initial_latents = torch.randn(
+                (batch_size, self.pipe.unet.in_channels, height // 8, width // 8),
+                generator=generator,
+                device="cuda",
+            )
+            do_classifier_free_guidance = guidance_scale > 1.0
+            text_embeddings_start = self.pipe.embed_text(
+                prompt_start, do_classifier_free_guidance, batch_size
+            )
+            text_embeddings_end = self.pipe.embed_text(
+                prompt_end, do_classifier_free_guidance, batch_size
+            )
+            text_embeddings_mid = slerp(0.5, text_embeddings_start, text_embeddings_end)
+            latents_mid = self.pipe.denoise(
+                latents=initial_latents,
+                text_embeddings=text_embeddings_mid,
+                t_start=1,
+                t_end=num_initial_steps,
+                guidance_scale=guidance_scale,
             )
 
+            print("Generating first frame")
             # re-initialize scheduler
             self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-
-            latents = self.pipe.denoise(
+            latents_start = self.pipe.denoise(
                 latents=latents_mid,
-                text_embeddings=text_embeddings,
+                text_embeddings=text_embeddings_start,
                 t_start=num_initial_steps,
                 t_end=None,
                 guidance_scale=guidance_scale,
             )
+            image_start = self.pipe.latents_to_image(latents_start)
+            self.pipe.safety_check(image_start)
 
-            # Run safety check on first and last frame
-            if i == 0 or i == num_animation_frames - 1:
-                self.pipe.safety_check(self.pipe.latents_to_image(latents))
+            if intermediate_output:
+                yield save_pil_image(
+                    self.pipe.numpy_to_pil(image_start)[0], path="/tmp/output-0.png"
+                )
 
-            # de-noise this frame
-            frames_latents.append(latents)
+            print("Generating last frame")
+            # re-initialize scheduler
+            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
+            latents_end = self.pipe.denoise(
+                latents=latents_mid,
+                text_embeddings=text_embeddings_end,
+                t_start=num_initial_steps,
+                t_end=None,
+                guidance_scale=guidance_scale,
+            )
+            image_end = self.pipe.latents_to_image(latents_end)
+            self.pipe.safety_check(image_end)
 
-        # Decode images by interpolate between animation frames
-        if film_interpolation:
-            images = self.interpolate_film(frames_latents, num_interpolation_steps)
-        else:
-            images = self.interpolate_latents(frames_latents, num_interpolation_steps)
+            # Generate latents for animation frames
+            frames_latents = []
+            for i in range(num_animation_frames):
+                if i == 0:
+                    latents = latents_start
+                elif i == num_animation_frames - 1:
+                    latents = latents_end
+                else:
+                    print(f"Generating frame {i}")
+                    text_embeddings = slerp(
+                        i / (num_animation_frames - 1),
+                        text_embeddings_start,
+                        text_embeddings_end,
+                    )
 
-        # Save the video
-        if gif_ping_pong:
-            images += images[-1:1:-1]
+                    # re-initialize scheduler
+                    self.pipe.scheduler = make_scheduler(
+                        num_inference_steps, initial_scheduler
+                    )
+                    latents = self.pipe.denoise(
+                        latents=latents_mid,
+                        text_embeddings=text_embeddings,
+                        t_start=num_initial_steps,
+                        t_end=None,
+                        guidance_scale=guidance_scale,
+                    )
 
-        if output_format == "gif":
-            return self.save_gif(images, gif_frames_per_second)
-        else:
-            return self.save_mp4(images, gif_frames_per_second, width, height)
+                # de-noise this frame
+                frames_latents.append(latents)
+                if intermediate_output and i > 0:
+                    image = self.pipe.latents_to_image(latents)
+                    yield save_pil_image(
+                        self.pipe.numpy_to_pil(image)[0], path=f"/tmp/output-{i}.png"
+                    )
+
+            # Decode images by interpolate between animation frames
+            if film_interpolation:
+                images = self.interpolate_film(frames_latents, num_interpolation_steps)
+            else:
+                images = self.interpolate_latents(
+                    frames_latents, num_interpolation_steps
+                )
+
+            # Save the video
+            if gif_ping_pong:
+                images += images[-1:1:-1]
+
+            if output_format == "gif":
+                yield self.save_gif(images, gif_frames_per_second)
+            else:
+                yield self.save_mp4(images, gif_frames_per_second, width, height)
 
     def save_mp4(self, images, fps, width, height):
         print("Saving MP4")
@@ -294,3 +341,8 @@ def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
         v2 = torch.from_numpy(v2).to(input_device)
 
     return v2
+
+
+def save_pil_image(image, path):
+    image.save(path)
+    return Path(path)
