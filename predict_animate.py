@@ -110,7 +110,7 @@ class Predictor(BasePredictor):
         batch_size = 1
 
         # Generate initial latents to start to generate animation frames from
-        self.pipe.scheduler = make_scheduler(num_inference_steps)
+        initial_scheduler = self.pipe.scheduler = make_scheduler(num_inference_steps)
         num_initial_steps = int(num_inference_steps * (1 - prompt_strength))
         print(f"Generating initial latents for {num_initial_steps} steps")
         initial_latents = torch.randn(
@@ -145,7 +145,7 @@ class Predictor(BasePredictor):
             )
 
             # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps)
+            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
 
             latents = self.pipe.denoise(
                 latents=latents_mid,
@@ -255,11 +255,16 @@ class Predictor(BasePredictor):
         return images
 
 
-def make_scheduler(num_inference_steps):
+def make_scheduler(num_inference_steps, from_scheduler=None):
     scheduler = PNDMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
     )
     scheduler.set_timesteps(num_inference_steps, offset=1)
+    if from_scheduler:
+        scheduler.cur_model_output = from_scheduler.cur_model_output
+        scheduler.counter = from_scheduler.counter
+        scheduler.cur_sample = from_scheduler.cur_sample
+        scheduler.ets = from_scheduler.ets[:]
     return scheduler
 
 
