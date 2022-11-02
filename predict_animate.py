@@ -25,9 +25,7 @@ class Predictor(BasePredictor):
         """Load the model into memory to make running multiple predictions efficient"""
         print("Loading pipeline...")
         self.pipe = StableDiffusionAnimationPipeline.from_pretrained(
-            "CompVis/stable-diffusion-v1-4",
-            scheduler=make_scheduler(100),  # timesteps is arbitrary at this point
-            revision="fp16",
+            "runwayml/stable-diffusion-v1-5",
             torch_dtype=torch.float16,
             cache_dir=MODEL_CACHE,
             local_files_only=True,
@@ -50,7 +48,9 @@ class Predictor(BasePredictor):
     def predict(
         self,
         prompt_start: str = Input(description="Prompt to start the animation with"),
-        prompt_end: str = Input(description="Prompt to end the animation with"),
+        prompt_end: str = Input(
+            description="Prompt to end the animation with. You can include multiple prompts by separating the prompts with | (the 'pipe' character)"
+        ),
         width: int = Input(
             description="Width of output image",
             choices=[128, 256, 512, 768, 1024],
@@ -92,7 +92,7 @@ class Predictor(BasePredictor):
         ),
         film_interpolation: bool = Input(
             description="Whether to use FILM for between-frame interpolation (film-net.github.io)",
-            default=False,
+            default=True,
         ),
         intermediate_output: bool = Input(
             description="Whether to display intermediate outputs during generation",
@@ -126,13 +126,33 @@ class Predictor(BasePredictor):
                 device="cuda",
             )
             do_classifier_free_guidance = guidance_scale > 1.0
-            text_embeddings_start = self.pipe.embed_text(
-                prompt_start, do_classifier_free_guidance, batch_size
-            )
-            text_embeddings_end = self.pipe.embed_text(
-                prompt_end, do_classifier_free_guidance, batch_size
-            )
-            text_embeddings_mid = slerp(0.5, text_embeddings_start, text_embeddings_end)
+
+            print("Generating first and last keyframes")
+            # re-initialize scheduler
+            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
+
+            prompts = [prompt_start] + [
+                p.strip() for p in prompt_end.strip().split("|")
+            ]
+            keyframe_text_embeddings = []
+            keyframe_latents = []
+
+            for prompt in prompts:
+                keyframe_text_embeddings.append(
+                    self.pipe.embed_text(
+                        prompt, do_classifier_free_guidance, batch_size
+                    )
+                )
+
+            if len(prompts) % 2 == 0:
+                i = len(prompts) // 2 - 1
+                prev_text_emb = keyframe_text_embeddings[i]
+                next_text_emb = keyframe_text_embeddings[i + 1]
+                text_embeddings_mid = slerp(0.5, prev_text_emb, next_text_emb)
+            else:
+                i = len(prompts) // 2
+                text_embeddings_mid = keyframe_text_embeddings[i]
+
             latents_mid = self.pipe.denoise(
                 latents=initial_latents,
                 text_embeddings=text_embeddings_mid,
@@ -141,50 +161,43 @@ class Predictor(BasePredictor):
                 guidance_scale=guidance_scale,
             )
 
-            print("Generating first frame")
-            # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-            latents_start = self.pipe.denoise(
-                latents=latents_mid,
-                text_embeddings=text_embeddings_start,
-                t_start=num_initial_steps,
-                t_end=None,
-                guidance_scale=guidance_scale,
-            )
-            image_start = self.pipe.latents_to_image(latents_start)
+            for prompt in [prompts[0], prompts[-1]]:
+                keyframe_latents.append(
+                    self.pipe.denoise(
+                        latents=latents_mid,
+                        text_embeddings=keyframe_text_embeddings[i],
+                        t_start=num_initial_steps,
+                        t_end=None,
+                        guidance_scale=guidance_scale,
+                    )
+                )
+
+
+            image_start = self.pipe.latents_to_image(keyframe_latents[0])
             self.pipe.safety_check(image_start)
+
+            image_end = self.pipe.latents_to_image(keyframe_latents[-1])
+            self.pipe.safety_check(image_end)
+
+            if gif_ping_pong:
+                prompts.append(prompts[0])
+                keyframe_text_embeddings.append(keyframe_text_embeddings[0])
+                keyframe_latents.append(keyframe_latents[0])
 
             if intermediate_output:
                 yield save_pil_image(
                     self.pipe.numpy_to_pil(image_start)[0], path="/tmp/output-0.png"
                 )
 
-            print("Generating last frame")
-            # re-initialize scheduler
-            self.pipe.scheduler = make_scheduler(num_inference_steps, initial_scheduler)
-            latents_end = self.pipe.denoise(
-                latents=latents_mid,
-                text_embeddings=text_embeddings_end,
-                t_start=num_initial_steps,
-                t_end=None,
-                guidance_scale=guidance_scale,
-            )
-            image_end = self.pipe.latents_to_image(latents_end)
-            self.pipe.safety_check(image_end)
-
-            # Generate latents for animation frames
+            # Generate animation frames
             frames_latents = []
-            for i in range(num_animation_frames):
-                if i == 0:
-                    latents = latents_start
-                elif i == num_animation_frames - 1:
-                    latents = latents_end
-                else:
-                    print(f"Generating frame {i}")
+            for keyframe in range(len(prompts) - 1):
+                for i in range(num_animation_frames):
+                    print(f"Generating frame {i} of keyframe {keyframe}")
                     text_embeddings = slerp(
-                        i / (num_animation_frames - 1),
-                        text_embeddings_start,
-                        text_embeddings_end,
+                        i / num_animation_frames,
+                        keyframe_text_embeddings[keyframe],
+                        keyframe_text_embeddings[keyframe + 1],
                     )
 
                     # re-initialize scheduler
@@ -199,13 +212,17 @@ class Predictor(BasePredictor):
                         guidance_scale=guidance_scale,
                     )
 
-                # de-noise this frame
-                frames_latents.append(latents)
-                if intermediate_output and i > 0:
-                    image = self.pipe.latents_to_image(latents)
-                    yield save_pil_image(
-                        self.pipe.numpy_to_pil(image)[0], path=f"/tmp/output-{i}.png"
-                    )
+                    # de-noise this frame
+                    frames_latents.append(latents)
+                    if intermediate_output and i > 0:
+                        image = self.pipe.latents_to_image(latents)
+                        yield save_pil_image(
+                            self.pipe.numpy_to_pil(image)[0],
+                            path=f"/tmp/output-{i}.png",
+                        )
+
+            if gif_ping_pong:
+                frames_latents.append(frames_latents[0])
 
             # Decode images by interpolate between animation frames
             if film_interpolation:
@@ -216,9 +233,6 @@ class Predictor(BasePredictor):
                 )
 
             # Save the video
-            if gif_ping_pong:
-                images += images[-1:1:-1]
-
             if output_format == "gif":
                 yield self.save_gif(images, gif_frames_per_second)
             else:
